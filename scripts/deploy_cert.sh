@@ -37,7 +37,7 @@ cp "$SRC_DIR/fullchain.pem" "$TARGET_DIR/cert.pem"
 cp "$SRC_DIR/privkey.pem" "$TARGET_DIR/key.pem"
 # put the new cert and private key where the app expects them
 
-chmod 600 $TARGET_DIR/key.pem
+chmod 600 "$TARGET_DIR/key.pem"
 # 600 = only the owner can read or write the private key. A security basic
 
 systemctl restart "$SERVICE"

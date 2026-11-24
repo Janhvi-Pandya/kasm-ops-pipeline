@@ -1,8 +1,13 @@
-name: lint
+name: pipeline
+
 on:
   push:
     branches: [main]
   pull_request:
+
+env:
+  AWS_REGION: 	us-east-2
+  # one place to set the region; every job below can read it
 
 jobs:
   shellcheck:
@@ -11,6 +16,73 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run shellcheck
         run: shellcheck scripts/*.sh
+        # now lints both scripts
 
-  
-    
+  deploy-dev:
+    needs: shellcheck
+    # GATE: this job only starts if shellcheck passed
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # only deploy on a push to main, never on a pull request
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      # allows this job to request the OIDC "ID card" from GitHub
+      contents: read
+      # allows checkout to read the repo, nothing more (least privilege)
+    env:
+      INSTANCE_ID: ${{ secrets.DEV_INSTANCE_ID }}
+      # put the secret into a variable once, instead of pasting ${{ }} into commands
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to AWS with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        # Amazon's ready-made action: swaps the ID card for temporary AWS credentials
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          # the github-actions-deploy role you made
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Send the scripts to the dev server through SSM
+        id: send
+        # an id lets the next step read this step's output
+        run: |
+          SETUP_B64=$(base64 -w0 scripts/setup_dev.sh)
+          DEPLOY_B64=$(base64 -w0 scripts/deploy_cert.sh)
+          PARAMS=$(jq -n --arg s "$SETUP_B64" --arg d "$DEPLOY_B64" '{commands: [
+            "set -e",
+            "echo \($s) | base64 -d > /tmp/setup_dev.sh",
+            "echo \($d) | base64 -d > /tmp/deploy_cert.sh",
+            "bash /tmp/setup_dev.sh",
+            "bash /tmp/deploy_cert.sh",
+            "curl -sk https://localhost"
+          ]}')
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA::7}" \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" --output text)
+          echo "Sent command $CMD_ID"
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the result and show the server's output
+        env:
+          CMD_ID: ${{ steps.send.outputs.command_id }}
+          # read the command ID the previous step saved
+        run: |
+          STATUS=Pending
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            echo "Check $i: $STATUS"
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query "[StandardOutputContent, StandardErrorContent]" --output text
+          [ "$STATUS" = "Success" ]

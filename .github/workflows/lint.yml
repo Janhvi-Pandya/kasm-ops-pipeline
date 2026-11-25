@@ -6,7 +6,7 @@ on:
   pull_request:
 
 env:
-  AWS_REGION: us-east-2
+  AWS_REGION: us-east-1
   # one place to set the region; every job below can read it
 
 jobs:
